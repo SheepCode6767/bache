@@ -59,6 +59,41 @@ static void CANServiceInit()
     HAL_CAN_ActivateNotification(&hcan2, CAN_IT_RX_FIFO1_MSG_PENDING);
 }
 
+/* ================= 诊断用:CAN1 未注册报文的监视 =================
+ * 给 CAN1 加一个"全通"过滤器(mask=0),让所有 CAN1 报文都能进 FIFO1;
+ * 这样下面的接收回调就能把"没有匹配上任何已注册实例"的报文 ID 打出来。
+ *
+ * 用途:排查"电调拨码 ID 和固件里写的不一样""电机根本没发报文"这类问题。
+ *      比如 6020 的反馈帧是 0x204+ID —— 如果日志里出现 0x207,就说明拨码是 3;
+ *      如果什么 ID 都没出现,说明电机侧压根没报文(没上电 / CAN 线不通)。
+ *
+ * 注意:bxCAN 中同一帧同时匹配多个过滤器时,只会进"编号最小"那个过滤器的 FIFO,
+ *      所以 0x205 这类已注册 ID 依然只走它自己的 FIFO,不会被重复处理。
+ *      以后不需要这个诊断了:把下面 FilterActivation 改成 CAN_FILTER_DISABLE
+ *      (或注释掉 CANAddMonitorFilter() 的调用)即可。
+ */
+volatile uint32_t can1_unknown_rx_cnt  = 0;   // CAN1 上"未匹配任何实例"的报文总数(watch 可看)
+volatile uint16_t can1_unknown_ids[8]  = {0}; // 见过的未匹配报文 ID,最多记 8 个(watch 可看)
+
+static void CANAddMonitorFilter(void)
+{
+    CAN_FilterTypeDef filter_conf;
+
+    filter_conf.FilterMode           = CAN_FILTERMODE_IDMASK;
+    filter_conf.FilterScale          = CAN_FILTERSCALE_32BIT;
+    filter_conf.FilterIdHigh         = 0x0000;
+    filter_conf.FilterIdLow          = 0x0000;
+    filter_conf.FilterMaskIdHigh     = 0x0000; // 掩码全 0 => 所有 ID 都通过
+    filter_conf.FilterMaskIdLow      = 0x0000;
+    filter_conf.FilterFIFOAssignment = CAN_RX_FIFO1;
+    filter_conf.FilterBank           = 13;     // 0~13 给 CAN1 用,13 是最后一个
+    filter_conf.FilterActivation     = CAN_FILTER_ENABLE;
+    filter_conf.SlaveStartFilterBank = 14;
+
+    HAL_CAN_ConfigFilter(&hcan1, &filter_conf);
+    LOGINFO("[bsp_can] CAN1 monitor filter added (unknown-ID logging on)");
+}
+
 /* ----------------------- two extern callable function -----------------------*/
 
 CANInstance *CANRegister(CAN_Init_Config_s *config)
@@ -67,6 +102,7 @@ CANInstance *CANRegister(CAN_Init_Config_s *config)
     {
         CANServiceInit(); // 第一次注册,先进行硬件初始化
         LOGINFO("[bsp_can] CAN Service Init");
+        CANAddMonitorFilter(); // 诊断:让 CAN1 上未注册的报文也能收到并打日志
     }
     if (idx >= CAN_MX_REGISTER_CNT) // 超过最大实例数
     {
@@ -200,6 +236,24 @@ static void CANFIFOxCallback(CAN_HandleTypeDef *_hcan, uint32_t fifox)
                     can_instance[i]->can_module_callback(can_instance[i]);     // 触发回调进行数据解析和处理
                 }
                 return;
+            }
+        }
+
+        /* 走到这里 = 没有任何已注册实例匹配这条报文(诊断用)。
+         * 计数 + 把 ID 记下来,每个新 ID 只打一条日志,避免刷屏。 */
+        can1_unknown_rx_cnt++;
+        for (uint8_t k = 0; k < 8; k++)
+        {
+            if (can1_unknown_ids[k] == rxconf.StdId)
+                break;                  // 这个 ID 已经记过、打过日志了
+            if (can1_unknown_ids[k] == 0) // 空槽:记下并打日志
+            {
+                can1_unknown_ids[k] = rxconf.StdId;
+                LOGWARNING("[bsp_can] can%d unknown rx id = 0x%03X, DLC=%d, data: %02X %02X %02X %02X %02X %02X %02X %02X",
+                           _hcan == &hcan1 ? 1 : 2, rxconf.StdId, rxconf.DLC,
+                           can_rx_buff[0], can_rx_buff[1], can_rx_buff[2], can_rx_buff[3],
+                           can_rx_buff[4], can_rx_buff[5], can_rx_buff[6], can_rx_buff[7]);
+                break;
             }
         }
     }
