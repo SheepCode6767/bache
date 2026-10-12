@@ -127,8 +127,11 @@ void RobotCMDTask()
         }
         gimbal_cmd_send.target_speed = sweep_speed;
     } else {
-        /* A下 D上:按 yaw_mid_speed_ref 匀速旋转,右摇杆"拨一下"加减一个步长 */
-        gimbal_cmd_send.mode = YAW_SPEED_CTRL;
+        /* A下 D上:按 yaw_mid_speed_ref 匀速旋转,右摇杆"拨一下"加减一个步长。
+         * 这里用"角度斜坡"而不是直接给速度环:目标角度按该角速度线性递增,
+         * gimbal 侧用 角度环(外)+速度环(内)+速度前馈 跟随 —— 这样低速摩擦小
+         * 也不会像"纯速度环+只有P"那样等幅震荡(不需要 D,不会有啸叫)。 */
+        gimbal_cmd_send.mode = YAW_ANGLE_RAMP;
         float r1             = stick;
         if (stick_armed) {
             if (r1 > YAW_STICK_UP_TH) { // 往上拨一下:加速

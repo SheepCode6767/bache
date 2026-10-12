@@ -65,6 +65,7 @@ typedef enum {
     YAW_ZERO_FORCE = 0, // 急停:输出电流置零,云台可被外力自由转动
     YAW_SPEED_CTRL,     // 速度闭环
     YAW_ANGLE_LOCK,     // 锁角度:保持进入该模式时的角度(角度环为外环、速度环为内环)
+    YAW_ANGLE_RAMP,     // 匀速转动:目标角度按给定角速度线性递增(角度环+速度环+速度前馈)
 } Yaw_Mode_e;
 
 /* robot_cmd(发布) -> gimbal(订阅) 的云台控制指令 */

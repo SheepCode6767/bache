@@ -13,6 +13,10 @@ static uint32_t gimbal_dwt_cnt;
 static uint8_t yaw_angle_lock_on    = 0;    // 当前是否处于锁角度
 static float   yaw_angle_lock_angle = 0.0f; // 锁住的目标角度 [°]
 
+/* 匀速档(角度斜坡)的状态 */
+static uint8_t yaw_ramp_on    = 0;    // 当前是否处于角度斜坡模式
+static float   yaw_ramp_angle = 0.0f; // 斜坡模式下按角速度累加出来的目标角度 [°]
+
 /* ===================== 调试用的全局变量 =====================
  * 这些变量只写、不参与控制,唯一用途是让你在Ozone/调试器的watch窗口里
  * 直接敲名字就能看到数值(所以不能加static,加了就看不见了)。
@@ -29,6 +33,8 @@ volatile float    gimbal_yaw_current   = 0.0f; // 实际电流
 volatile float    gimbal_yaw_angle     = 0.0f; // 电机反馈的累计角度 [°](锁角度的反馈)
 volatile float    gimbal_yaw_lock_angle = 0.0f; // 锁角度时锁住的目标角度 [°]
 volatile uint8_t  gimbal_yaw_mode      = 0;    // 当前模式:0=急停(无力),1=速度闭环,2=锁角度
+volatile float    gimbal_yaw_ramp_ref  = 0.0f; // 斜坡模式的目标角度 [°](调试用)
+float             yaw_speed_ff         = 0.0f; // 速度前馈值 [°/s](斜坡模式下=期望角速度,其它模式为0)
 
 DJIMotorInstance *GimbalGetYawMotor()
 {
@@ -59,11 +65,13 @@ void GimbalInit()
                 .MaxOut        = YAW_SPEED_MAX_OUT,
                 .Improve       = PID_Integral_Limit | PID_Derivative_On_Measurement,
             },
+            .speed_feedforward_ptr = &yaw_speed_ff, // 速度前馈:直接加到速度环设定值上
         },
         .controller_setting_init_config = {
             // 没有IMU,速度和角度反馈都只能来自电机自身(6020的编码器与转速)
             .angle_feedback_source = MOTOR_FEED,
             .speed_feedback_source = MOTOR_FEED,
+            .feedforward_flag      = SPEED_FEEDFORWARD, // 启用速度前馈
             .outer_loop_type       = SPEED_LOOP,              // 默认速度环;锁角度时在运行中切到角度环
             .close_loop_type       = ANGLE_LOOP | SPEED_LOOP, // 两个环都启用,才能运行时切换外环
             .motor_reverse_flag    = YAW_MOTOR_REVERSE ? MOTOR_DIRECTION_REVERSE : MOTOR_DIRECTION_NORMAL,
@@ -101,14 +109,43 @@ void GimbalTask()
         DJIMotorStop(gimbal_yaw_motor); // 输出电流置零
         yaw_speed_ref = 0.0f;           // 下次使能时从零开始加速,避免突然给出大电流
         gimbal_yaw_speed_ref = 0.0f;
+        yaw_speed_ff = 0.0f;            // 前馈也清零
         if (yaw_angle_lock_on) { // 退出锁角度,外环换回速度环
             yaw_angle_lock_on = 0;
+            DJIMotorOuterLoop(gimbal_yaw_motor, SPEED_LOOP);
+        }
+        if (yaw_ramp_on) { // 退出斜坡模式
+            yaw_ramp_on = 0;
             DJIMotorOuterLoop(gimbal_yaw_motor, SPEED_LOOP);
         }
         return;
     }
 
     DJIMotorEnable(gimbal_yaw_motor);
+
+    /* 匀速转动(角度斜坡):目标角度按给定角速度线性递增,用角度环(外)+速度环(内)跟随;
+     * 同时把这个角速度当前馈直接加到速度环设定值上 —— 角度环只需要修正很小的残差,
+     * 所以 YAW_ANGLE_KP 可以取小,低速摩擦小也不会等幅震荡(不需要 D)。*/
+    if (gimbal_cmd_recv.mode == YAW_ANGLE_RAMP) {
+        if (!yaw_ramp_on) { // 刚进入这个档
+            yaw_ramp_angle   = gimbal_yaw_motor->measure.total_angle;
+            yaw_ramp_on      = 1;
+            yaw_speed_ref    = 0.0f; // 下次切回速度环时从0平滑起步
+            gimbal_yaw_speed_ref = 0.0f;
+            DJIMotorOuterLoop(gimbal_yaw_motor, ANGLE_LOOP); // 外环切成角度环
+        }
+        yaw_speed_ff          = gimbal_cmd_recv.target_speed; // 速度前馈 = 期望角速度
+        yaw_ramp_angle       += gimbal_cmd_recv.target_speed * dt;
+        gimbal_yaw_ramp_ref   = yaw_ramp_angle;
+        DJIMotorSetRef(gimbal_yaw_motor, yaw_ramp_angle);
+        return;
+    }
+
+    if (yaw_ramp_on) { // 从斜坡模式切回速度环
+        yaw_ramp_on  = 0;
+        yaw_speed_ff = 0.0f;
+        DJIMotorOuterLoop(gimbal_yaw_motor, SPEED_LOOP);
+    }
 
     /* 锁角度:进入时锁住当时的角度,之后目标角度保持不变,外力推开会自动回位 */
     if (gimbal_cmd_recv.mode == YAW_ANGLE_LOCK) {
@@ -128,6 +165,8 @@ void GimbalTask()
         yaw_angle_lock_on = 0;
         DJIMotorOuterLoop(gimbal_yaw_motor, SPEED_LOOP);
     }
+
+    yaw_speed_ff = 0.0f; // 普通速度环模式下不使用前馈
 
     // 对目标角速度做变化率限幅
     float step = YAW_SPEED_SLEW * dt;
