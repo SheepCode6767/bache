@@ -15,7 +15,7 @@
 #define ONE_BOARD // 单块开发板控制整车
 
 /* ======================== 云台yaw(6020) ======================== */
-#define YAW_MOTOR_ID      1 // 6020电调拨码上的ID,反馈报文ID = 0x204 + ID = 0x205
+#define YAW_MOTOR_ID      3 // 6020电调拨码上的ID(实测拨码=3),反馈报文ID = 0x204 + ID = 0x207
 #define YAW_MOTOR_REVERSE 0 // 摇杆向上而云台往反方向转时改成1
 
 #define YAW_SPEED_MAX    720.0f // [°/s] 摇杆调速模式的速度上限(右摇杆打满时的目标角速度)
