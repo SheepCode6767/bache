@@ -124,6 +124,17 @@ typedef struct // config parameter
  */
 void PIDInit(PIDInstance *pid, PID_Init_Config_s *config);
 PIDInstance *PIDRegister(PID_Init_Config_s *config);
+
+/**
+ * @brief 清空PID的运行状态(积分、历史误差、输出),**保留**Kp/Ki/Kd等参数
+ *
+ * @note  用在"卸电/急停"这种场合:电机都已经不给电流了,再留着一坨积分没有意义,
+ *        而且下次使能时会把那坨积分一次性放出去(起步突然冲一下)。
+ *
+ * @param pid PID实例指针
+ */
+void PIDReset(PIDInstance *pid);
+
 /**
  * @brief 计算PID输出
  *

@@ -155,6 +155,32 @@ PIDInstance *PIDRegister(PID_Init_Config_s *config)
     DWT_GetDeltaT(&pid->DWT_CNT);
     return pid;
 }
+
+/**
+ * @brief 清空PID的运行状态(积分、历史误差、输出),保留Kp/Ki/Kd等参数
+ *
+ * @note  给"卸电/急停"用:电机都不给电流了,留着积分没意义;而且下次使能时
+ *        会把那坨积分一次性放出去,表现就是起步突然冲一下。
+ *
+ * @param pid PID实例指针
+ */
+void PIDReset(PIDInstance *pid)
+{
+    pid->Measure      = 0.0f;
+    pid->Last_Measure = 0.0f;
+    pid->Err          = 0.0f;
+    pid->Last_Err     = 0.0f;
+    pid->Pout         = 0.0f;
+    pid->Iout         = 0.0f;
+    pid->Dout         = 0.0f;
+    pid->ITerm        = 0.0f;
+    pid->Last_ITerm   = 0.0f;
+    pid->Output       = 0.0f;
+    pid->Last_Output  = 0.0f;
+    pid->Last_Dout    = 0.0f;
+    DWT_GetDeltaT(&pid->DWT_CNT); // 顺便把计时清掉,免得下一拍算出一个特别大的dt
+}
+
 /**
  * @brief          PID计算
  * @param[in]      PID结构体

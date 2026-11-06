@@ -51,21 +51,30 @@
 osThreadId_t defaultTaskHandle;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for CMD */
 osThreadId_t CMDHandle;
 const osThreadAttr_t CMD_attributes = {
   .name = "CMD",
-  .stack_size = 128 * 4,
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityHigh7,
+};
+/* Definitions for IMU */
+osThreadId_t IMUHandle;
+const osThreadAttr_t IMU_attributes = {
+  .name = "IMU",
+  .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityHigh7,
 };
 /* Definitions for Gimbal */
 osThreadId_t GimbalHandle;
 const osThreadAttr_t Gimbal_attributes = {
   .name = "Gimbal",
-  .stack_size = 128 * 4,
+  /* 512 字节不够:这条任务里调用了 sinf()/fmodf()(newlib 的数学库本身也要用栈),
+   * 实测栈溢出钩子报的就是 Gimbal。给到 4096 字节,留出调试器/日志的余量。 */
+  .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityHigh,
 };
 /* Definitions for motorControl */
@@ -75,11 +84,22 @@ const osThreadAttr_t motorControl_attributes = {
   .stack_size = 512 * 4,
   .priority = (osPriority_t) osPriorityHigh,
 };
+/* Definitions for Chassis */
+osThreadId_t ChassisHandle;
+const osThreadAttr_t Chassis_attributes = {
+  .name = "Chassis",
+  /* 512字节(128*4)对这条任务太紧了:它每拍都做浮点运算,还要调电机框架、写RTT日志,
+   * 而硬浮点任务的上下文本身就比纯整数任务多占 ~72 字节(FPU 寄存器 + 对齐)。
+   * 先给到 2048 字节(512*4);其它任务暂时不动,用 configCHECK_FOR_STACK_OVERFLOW 的钩子盯着,
+   * 哪个任务报溢出再加哪个。 */
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
 /* Definitions for Daemon */
 osThreadId_t DaemonHandle;
 const osThreadAttr_t Daemon_attributes = {
   .name = "Daemon",
-  .stack_size = 128 * 4,
+  .stack_size = 256 * 4,
   .priority = (osPriority_t) osPriorityHigh,
 };
 
@@ -121,11 +141,14 @@ void MX_FREERTOS_Init(void) {
   /* creation of defaultTask */
   defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
     /* creation of CMD */
-  CMDHandle = osThreadNew(_RobotCMDTask, NULL, &CMD_attributes);  
+  CMDHandle = osThreadNew(_RobotCMDTask, NULL, &CMD_attributes);
+  IMUHandle = osThreadNew(_ImuTask, NULL, &IMU_attributes);
     motorControlHandle = osThreadNew(motorControlTask, NULL, &motorControl_attributes); 
   /* creation of Gimbal */
 
  GimbalHandle = osThreadNew(_GimbalTask, NULL, &Gimbal_attributes);
+ /* creation of Chassis */
+ ChassisHandle = osThreadNew(_ChassisTask, NULL, &Chassis_attributes);
 DaemonHandle = osThreadNew(_DaemonTask, NULL, &Daemon_attributes);
   /* USER CODE BEGIN RTOS_THREADS */
     /* add threads, ... */
@@ -147,9 +170,19 @@ DaemonHandle = osThreadNew(_DaemonTask, NULL, &Daemon_attributes);
 void StartDefaultTask(void *argument)
 {
   /* init code for USB_DEVICE */
-  MX_USB_DEVICE_Init();
+  //MX_USB_DEVICE_Init(); // 本车不用USB,见下面USER CODE里的说明(要用虚拟串口时把本行还原)
   /* USER CODE BEGIN StartDefaultTask */
     UNUSED(argument);
+    /* 关于上面那句 MX_USB_DEVICE_Init() 为什么被注释掉:
+     *   1) 本工程没人用 USB CDC —— 只有 master_machine 的 master_process.c / vision.c 会调
+     *      USBTransmit(),而它们在本工程里根本没有被初始化(HostInit() 从未被调用)。
+     *   2) USB 的 HAL 代码里有好几处 HAL_Delay(USB_FlushTxFifo 100ms、PCD 的 LPM 300/50ms 等),
+     *      而本工程的 HAL 时基是 TIM6 中断 —— 一旦在关中断的区间里碰到它们就是永久卡死;
+     *      另外开机头几百毫秒都耗在这里,调试时一 halt 也经常停在这几个 HAL_Delay 上,容易看混。
+     *   3) 日志用的是 SEGGER RTT(走 J-Link 的 SWD),和 USB 无关,去掉它不影响调试。
+     *   以后要接上位机/视觉、或者想用虚拟串口给 vofa 送数据:把上面那一行的注释去掉,
+     *   并在应用里调用 HostInit()/USBInit() 即可。
+     *   注意:用CubeMX重新生成工程时这一行会回来,记得再注释一次。 */
     /* 启动提示音:改成"非阻塞"播放 —— 打开声音后立刻 osDelay 让出 CPU(不是忙等),
      * 100ms 后再关掉。这样即使调试器在提示音期间把 CPU Halt 住,也不会出现
      * "CPU 卡在忙等里、蜂鸣器一直响"的现象。 */
@@ -163,6 +196,28 @@ void StartDefaultTask(void *argument)
 
 /* Private application code --------------------------------------------------*/
 /* USER CODE BEGIN Application */
+
+/* ================= 任务栈溢出钩子 =================
+ * FreeRTOSConfig.h 里 configCHECK_FOR_STACK_OVERFLOW=2,任务栈一溢出就会被调用。
+ * 这里把"是哪个任务"的名字抄到 so_task_name(Ozone 的 watch 里按字符串看),然后停住。
+ * 加了它的好处:栈溢出会踩坏堆里相邻的内存,以前的表现是"在毫不相干的指令上莫名 HardFault",
+ * 现在会直接停在这个钩子里并告诉你任务名。 */
+volatile char so_task_name[16];
+volatile uint8_t so_hit;
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+  (void)xTask;
+  so_hit = 1; // 先把标志置上:即使任务名指针有问题,也能知道是栈溢出
+  for (uint8_t i = 0; i < 15; i++) {
+    so_task_name[i] = pcTaskName[i];
+    if (pcTaskName[i] == '\0')
+      break;
+  }
+  so_task_name[15] = '\0';
+  for (;;) {
+  }
+}
 
 /* USER CODE END Application */
 

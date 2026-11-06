@@ -17,12 +17,22 @@ void BSPLogInit();
  * @brief 日志功能原型,供下面的LOGI,LOGW,LOGE等使用
  *
  */
-#define LOG_PROTO(type, color, format, ...)                       \
-        SEGGER_RTT_printf(BUFFER_INDEX, "  %s%s" format "\r\n%s", \
-                          color,                                  \
-                          type,                                   \
-                          ##__VA_ARGS__,                          \
-                          RTT_CTRL_RESET)
+/* 颜色复位序列直接拼进格式串,末尾**不留 %s 参数** —— 这是防弹衣,不是美学问题:
+ *   SEGGER RTT 的 printf 只认 c/d/u/x/X/s/p/% 这几个格式符(见 SEGGER_RTT_printf.c),
+ *   碰到它不认识的(最典型的就是 %f,以及写错的格式符)它**不会消耗对应的参数**,
+ *   于是后面所有参数整体错位一格:原来末尾那个 %s(颜色复位)会拿一个错位的值当 char* 去解引用。
+ *   实测后果:0.1 秒内 HardFault,PC 停在 SEGGER_RTT_printf.c 的 "%s" 循环里
+ *   (c = *s; 那条 ldrb),CFSR 是精确总线错误,BFAR 是个几 GB 的野地址 —— 很难往"日志格式"
+ *   上想。所以:
+ *     ① 复位序列改成拼在格式串里(下面这样),错位也不会再变成"解引用野指针";
+ *     ② 要打浮点,用 Float2Str() 转成字符串再 %s,不要用 %f(本宏的调用方也遵守这条)。
+ *   %p 只有 8 位宽、且不做 0x 前缀之外的处理,%lx/%lu 里的 l 只是被跳过(不影响参数数量)。
+ */
+#define LOG_PROTO(type, color, format, ...)                                 \
+        SEGGER_RTT_printf(BUFFER_INDEX, "  %s%s" format RTT_CTRL_RESET "\r\n", \
+                          color,                                            \
+                          type,                                             \
+                          ##__VA_ARGS__)
 
 /*----------------------------------------下面是日志输出的接口-------------------------------------------------*/
 

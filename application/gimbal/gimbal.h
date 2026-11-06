@@ -13,9 +13,4 @@ void GimbalInit();
  */
 void GimbalTask();
 
-/**
- * @brief 获取yaw电机实例,便于在调试器中把它加入watch窗口观察反馈值
- */
-DJIMotorInstance *GimbalGetYawMotor();
-
 #endif // GIMBAL_H

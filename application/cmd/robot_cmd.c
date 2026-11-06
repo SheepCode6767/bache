@@ -3,44 +3,94 @@
 #include "robot_def.h"
 #include "remote_control.h"
 #include "message_center.h"
-#include "user_lib.h"
-#include "bsp_dwt.h" // 右上档线性扫速需要 dt
+#include "bsp_dwt.h"
+#include "chassis.h"
 
-/* 遥控器摇杆的满量程;DBUS摇杆范围是-660~660,模块层已经把|v|<10的死区滤掉了 */
+/* 遥控器摇杆和旋钮的满量程 */
 #define RC_STICK_FULL 660.0f
 
 static RC_ctrl_t *rc_data;                // 遥控器数据,初始化时返回
 static Publisher_t *gimbal_cmd_pub;       // 云台控制消息发布者
 static Gimbal_Ctrl_Cmd_s gimbal_cmd_send; // 要发给云台的控制信息
 
-/* "匀速档"(A下 D上)的目标速度:初值是 YAW_SPEED_ROTATE,之后用右摇杆上/下"拨一下"按
- * YAW_SPEED_STEP 加减,并限幅在 [YAW_SPEED_MIN, YAW_SPEED_MAX]。
- * 故意不加 static:这样可以在 Ozone 的 watch 窗口里直接写一个速度做阶跃响应(调速度环用)。 */
-float yaw_mid_speed_ref = YAW_SPEED_ROTATE;
-/* 摇杆要先回到中间区,才允许下一次加减(= 拨一下动一次,按住不会连加) */
-static uint8_t stick_armed = 1;
+/* A/D 短暂无效时沿用上一拍有效档位,超过 50ms 才急停。 */
+#define YAW_RC_INVALID_HOLD_MS 50.0f
+static uint8_t yaw_last_valid_a_up;
+static uint8_t yaw_last_valid_d_up;
+static uint8_t yaw_have_valid_gear;
+static float   yaw_invalid_ms;
+volatile uint8_t  rc_dbg_yaw_invalid_hold = 0;
+volatile uint16_t rc_dbg_yaw_invalid_ms   = 0;
 
-/* 右上档:目标速度在 [YAW_SPEED_SWEEP_MIN, YAW_SPEED_SWEEP_MAX] 之间线性来回摆动 */
-static float sweep_speed = YAW_SPEED_SWEEP_MIN; // 当前扫到的速度
-static float sweep_dir   = 1.0f;          // +1:朝 SWEEP_MAX 扫, -1:朝 SWEEP_MIN 扫
+/* 变速档当前目标速度和实际加速度,供 Ozone 观察。 */
+float sweep_speed = 0.0f;
+float sweep_accel = 0.0f;
+float sweep_dir = 1.0f;        // 当前半程方向:朝限幅点或返回0
+
+/* 旋钮映射后的目标值,供 Ozone 观察。 */
+volatile float gimbal_ld_target_speed  = YAW_SPEED_LD_MIN;
+volatile float gimbal_sweep_accel_rad  = 0.0f; // LD 映射后的正向加速度 [rad/s²]
+volatile float chassis_rd_target_speed = CHASSIS_SPEED_RD_MIN_MPS;
+volatile float rc_dbg_ld_percent = 0.0f;
+volatile float rc_dbg_rd_percent = 0.0f;
+/* C上档左右微调的最大差速,可在 Ozone 中在线修改。 */
+float chassis_swing_micro_turn_speed = CHASSIS_SWING_MICRO_TURN_SPEED_MPS;
+volatile float chassis_swing_micro_turn_cmd = 0.0f;
+
+static Publisher_t *chassis_cmd_pub;        // 底盘控制消息发布者
+static Chassis_Ctrl_Cmd_s chassis_cmd_send; // 要发给底盘的控制信息
+
+/* 遥控输入镜像,供 Ozone 检查通道和档位。 */
+volatile uint8_t rc_dbg_sw_left  = 0; // A/CH5:1=上 2=下;0=无效(未分配/中位/离线)
+volatile uint8_t rc_dbg_sw_right = 0; // D/CH6:1=上 2=下;0=无效(未分配/中位/离线)
+volatile int16_t rc_dbg_dial     = 0; // 拨轮 [-660,660]
+volatile int16_t rc_dbg_stick_r1 = 0; // 右摇杆竖直
+volatile uint8_t rc_dbg_yaw_gear = 0; // 云台档位:0=急停 1=定速 2=卸电 3=变速 0xFF=开关无效
+volatile uint8_t rc_dbg_yaw_a_up = 0; // 云台实际采用的 A 值
+volatile uint8_t rc_dbg_yaw_d_up = 0; // 云台实际采用的 D 值
 
 static uint8_t  last_sw_left  = 0xFF; // 上一次的左拨杆(=A)位置,用于换档时复位
 static uint8_t  last_sw_right = 0xFF; // 上一次的右拨杆(=D)位置
 static uint32_t cmd_dwt_cnt   = 0;    // DWT 计时(算 dt 用)
 
-/* ================= 无遥控器调试档 =================
- * 遥控器不在手上时,把 yaw_debug_enable 置 1(Ozone 的 watch 窗口里直接改),就不去读遥控器,
- * 而是用下面这几个变量模拟拨杆/摇杆:
- *   yaw_dbg_a_up  : A 拨杆(1=上, 0=下)
- *   yaw_dbg_d_up  : D 拨杆(1=上, 0=下)   —— 只想让它匀速转: a=0, d=1
- *   yaw_dbg_stick : 右摇杆竖直值(-660~660): 先给 >400 再回 0 = "往上拨一下"(+一个步长),反之为减速
- * 遥控器到手后把 yaw_debug_enable 改回 0 即可,不用重新编译。
- * 调"匀速转动"时:yaw_debug_enable=1, yaw_dbg_a_up=0, yaw_dbg_d_up=1,
- * 然后直接在 watch 里改 yaw_mid_speed_ref(例如 50/100/200)看阶跃响应。 */
-volatile uint8_t yaw_debug_enable = 0;
-volatile uint8_t yaw_dbg_a_up     = 0;
-volatile uint8_t yaw_dbg_d_up     = 1;
-volatile int16_t yaw_dbg_stick    = 0;
+static float KnobPercent(int16_t knob)
+{
+    float percent = (float)knob / RC_STICK_FULL;
+    if (percent < 0.0f)
+        return 0.0f;
+    if (percent > 1.0f)
+        return 1.0f;
+    return percent;
+}
+
+static float MapPercent(float percent, float min_value, float max_value)
+{
+    return min_value + percent * (max_value - min_value);
+}
+
+/**
+ * @brief 右摇杆水平 -> 有符号差速,按超过死区后的行程线性增大
+ *
+ * @return >0 左转,<0 右转
+ */
+static float ChassisTurnFromStick(float stick_h, float max_turn_speed)
+{
+    if (stick_h > CHASSIS_TURN_DEAD_ZONE) {
+        float norm = (stick_h - CHASSIS_TURN_DEAD_ZONE) /
+                     (RC_STICK_FULL - CHASSIS_TURN_DEAD_ZONE);
+        if (norm > 1.0f)
+            norm = 1.0f;
+        return -max_turn_speed * norm; // 往右推 = 右转
+    }
+    if (stick_h < -CHASSIS_TURN_DEAD_ZONE) {
+        float norm = (-stick_h - CHASSIS_TURN_DEAD_ZONE) /
+                     (RC_STICK_FULL - CHASSIS_TURN_DEAD_ZONE);
+        if (norm > 1.0f)
+            norm = 1.0f;
+        return max_turn_speed * norm; // 往左推 = 左转
+    }
+    return 0.0f;
+}
 
 /**
  * @brief 急停:云台不给电流
@@ -48,7 +98,74 @@ volatile int16_t yaw_dbg_stick    = 0;
 static void EmergencyHandler()
 {
     gimbal_cmd_send.mode         = YAW_ZERO_FORCE;
+    gimbal_cmd_send.profile      = GIMBAL_PROFILE_CONSTANT;
     gimbal_cmd_send.target_speed = 0.0f;
+}
+
+/**
+ * @brief 把两个应用的控制指令都发出去
+ */
+static void PublishCommand()
+{
+    PubPushMessage(gimbal_cmd_pub, (void *)&gimbal_cmd_send);
+    PubPushMessage(chassis_cmd_pub, (void *)&chassis_cmd_send);
+}
+
+/**
+ * @brief 把"C拨杆"翻译成三档:0=下, 1=中, 2=上
+ *
+ * @param dial     拨轮的原始值(-660~660)
+ */
+static uint8_t ChassisCDecode(int16_t dial)
+{
+    if (dial > CHASSIS_C_DIAL_TH)
+        return 2;
+    if (dial < -CHASSIS_C_DIAL_TH)
+        return 0;
+    return 1;
+}
+
+/**
+ * @brief 根据 C 拨杆和右摇杆生成底盘指令
+ *
+ * @param sw_c    C拨杆位置:0=下(停), 1=中(摇杆), 2=上(自动来回)
+ * @param stick_v 右摇杆竖直值(-660~660)
+ * @param stick_h 右摇杆水平值(-660~660)
+ * @param speed_mps RD 映射后的底盘速度
+ */
+static void ChassisCmdUpdate(uint8_t sw_c, float stick_v, float stick_h, float speed_mps)
+{
+    if (CHASSIS_STICK_V_REVERSE)
+        stick_v = -stick_v;
+    if (CHASSIS_STICK_H_REVERSE)
+        stick_h = -stick_h;
+
+    switch (sw_c) {
+        case 2: // C上:自动来回移动,水平摇杆只做小幅方向修正
+            chassis_cmd_send.mode       = CHASSIS_SWING_CTRL;
+            chassis_cmd_send.vx         = 0.0f;
+            chassis_cmd_send.turn_speed =
+                ChassisTurnFromStick(stick_h, chassis_swing_micro_turn_speed);
+            chassis_swing_micro_turn_cmd = chassis_cmd_send.turn_speed;
+            break;
+
+        case 1: // C中:右摇杆上下=定速直行,右摇杆水平=差速转弯
+            chassis_cmd_send.mode = CHASSIS_STICK_CTRL;
+            chassis_cmd_send.vx   = (stick_v > CHASSIS_STICK_DEAD_ZONE)    ? speed_mps
+                                    : (stick_v < -CHASSIS_STICK_DEAD_ZONE) ? -speed_mps
+                                                                           : 0.0f;
+            chassis_cmd_send.turn_speed = ChassisTurnFromStick(stick_h, speed_mps);
+            chassis_swing_micro_turn_cmd = 0.0f;
+            break;
+
+        case 0: // C下:急停
+        default:
+            chassis_cmd_send.mode       = CHASSIS_ZERO_FORCE_CTRL;
+            chassis_cmd_send.vx         = 0.0f;
+            chassis_cmd_send.turn_speed = 0.0f;
+            chassis_swing_micro_turn_cmd = 0.0f;
+            break;
+    }
 }
 
 void RobotCMDInit()
@@ -56,6 +173,7 @@ void RobotCMDInit()
     rc_data = RemoteControlInit(&huart3); // C板上遥控器接收机接在USART3
 
     gimbal_cmd_pub = PubRegister("gimbal_cmd", sizeof(Gimbal_Ctrl_Cmd_s));
+    chassis_cmd_pub = PubRegister("chassis_cmd", sizeof(Chassis_Ctrl_Cmd_s));
 
     DWT_GetDeltaT(&cmd_dwt_cnt); // 清一次计时,避免第一次算出的 dt 特别大
 }
@@ -63,90 +181,133 @@ void RobotCMDInit()
 void RobotCMDTask()
 {
     float dt = DWT_GetDeltaT(&cmd_dwt_cnt); // [s],扫速用
+    if (dt <= 0.0f || dt > 0.05f)
+        dt = 0.001f;
     uint8_t sw_left, sw_right, a_up, d_up;
-    float stick;
 
-    if (yaw_debug_enable) {
-        /* 调试档:用 watch 里的变量代替遥控器 */
-        a_up     = yaw_dbg_a_up ? 1 : 0;
-        d_up     = yaw_dbg_d_up ? 1 : 0;
-        stick    = (float)yaw_dbg_stick;
-        sw_left  = a_up ? RC_SW_UP : RC_SW_DOWN;
-        sw_right = d_up ? RC_SW_UP : RC_SW_DOWN;
-    } else {
-        /* 遥控器掉线时数据会被清零,此时两个开关都是0,也按急停处理 */
-        if (!RemoteControlIsOnline() ||
-            (rc_data[TEMP].rc.switch_left == 0 && rc_data[TEMP].rc.switch_right == 0)) {
+    /* LD:匀速档目标速度、变速档正向加速度;RD:底盘速度。 */
+    float ld_percent = KnobPercent(rc_data[TEMP].rc.knob_ld);
+    float rd_percent = KnobPercent(rc_data[TEMP].rc.knob_rd);
+    gimbal_ld_target_speed  = MapPercent(ld_percent, YAW_SPEED_LD_MIN, YAW_SPEED_LD_MAX);
+    gimbal_sweep_accel_rad  = MapPercent(ld_percent,
+                                         YAW_SWEEP_ACCEL_MIN_RAD,
+                                         YAW_SWEEP_ACCEL_MAX_RAD);
+    chassis_rd_target_speed = MapPercent(rd_percent,
+                                         CHASSIS_SPEED_RD_MIN_MPS,
+                                         CHASSIS_SPEED_RD_MAX_MPS);
+    rc_dbg_ld_percent = ld_percent * 100.0f;
+    rc_dbg_rd_percent = rd_percent * 100.0f;
+
+    /* RD 只作为 C中档的前后/转弯速度;C上档主速度独立固定为 1m/s。 */
+
+    /* 底盘:C/CH7 选档;C中右摇杆控制前后/转弯,C上只使用水平摇杆微调方向。 */
+    ChassisCmdUpdate(ChassisCDecode(rc_data[TEMP].rc.dial),
+                     (float)rc_data[TEMP].rc.rocker_r1,
+                     (float)rc_data[TEMP].rc.rocker_r_,
+                     chassis_rd_target_speed);
+
+    /* 遥控输入镜像 */
+    rc_dbg_sw_left  = rc_data[TEMP].rc.switch_left;
+    rc_dbg_sw_right = rc_data[TEMP].rc.switch_right;
+    rc_dbg_dial     = rc_data[TEMP].rc.dial;
+    rc_dbg_stick_r1 = rc_data[TEMP].rc.rocker_r1;
+
+    sw_left  = rc_data[TEMP].rc.switch_left;
+    sw_right = rc_data[TEMP].rc.switch_right;
+    a_up     = switch_is_up(sw_left) ? 1 : 0;
+    d_up     = switch_is_up(sw_right) ? 1 : 0;
+
+    if (!RemoteControlIsOnline() || sw_left == 0 || sw_right == 0) {
+        yaw_invalid_ms += dt * 1000.0f;
+        rc_dbg_yaw_invalid_ms = (uint16_t)yaw_invalid_ms;
+
+        if (!yaw_have_valid_gear || yaw_invalid_ms >= YAW_RC_INVALID_HOLD_MS) {
+            rc_dbg_yaw_gear = 0xFF;
+            rc_dbg_yaw_invalid_hold = 0;
             EmergencyHandler();
-            PubPushMessage(gimbal_cmd_pub, (void *)&gimbal_cmd_send);
+            PublishCommand();
             return;
         }
-        sw_left  = rc_data[TEMP].rc.switch_left;
-        sw_right = rc_data[TEMP].rc.switch_right;
-        a_up     = switch_is_up(sw_left) ? 1 : 0;
-        d_up     = switch_is_up(sw_right) ? 1 : 0;
-        stick    = (float)rc_data[TEMP].rc.rocker_r1;
+
+        a_up = yaw_last_valid_a_up;
+        d_up = yaw_last_valid_d_up;
+        rc_dbg_yaw_invalid_hold = 1;
+    } else {
+        yaw_invalid_ms = 0.0f;
+        yaw_last_valid_a_up = a_up;
+        yaw_last_valid_d_up = d_up;
+        yaw_have_valid_gear = 1;
+        rc_dbg_yaw_invalid_hold = 0;
+        rc_dbg_yaw_invalid_ms   = 0;
     }
 
-    /* 拨杆语义(A=左拨杆/SA, D=右拨杆/SD, 两档):
-     *   A下 D下 -> 停机(急停)      A下 D上 -> 定速旋转(原右中档)
-     *   A上 D下 -> 线性扫速(原右上档) A上 D上 -> 锁角度 */
+    rc_dbg_yaw_a_up = a_up;
+    rc_dbg_yaw_d_up = d_up;
 
-    /* A、D 双下:停机 */
+    /* A、D 双下:整车急停 */
     if (!a_up && !d_up) {
+        rc_dbg_yaw_gear = 0;
         EmergencyHandler();
-        PubPushMessage(gimbal_cmd_pub, (void *)&gimbal_cmd_send);
+#if CHASSIS_STOP_ON_AD_ESTOP
+        chassis_cmd_send.mode       = CHASSIS_ZERO_FORCE_CTRL;
+        chassis_cmd_send.vx         = 0.0f;
+        chassis_cmd_send.turn_speed = 0.0f;
+#endif
+        PublishCommand();
         return;
     }
 
-    /* 拨杆位置变化:复位"拨动"的边沿状态;进扫速档时让扫速从下限重新开始 */
+    /* 拨杆位置变化:复位"拨动"的边沿状态;进变速档时从零速重新开始 */
     if (sw_left != last_sw_left || sw_right != last_sw_right) {
         last_sw_left  = sw_left;
         last_sw_right = sw_right;
-        stick_armed   = 1;
-        if (a_up && !d_up) { // 刚进扫速档
-            sweep_speed = YAW_SPEED_SWEEP_MIN;
-            sweep_dir   = 1.0f;
+        if (a_up && d_up) { // 刚进变速档
+            sweep_speed = 0.0f;
+            sweep_accel = 0.0f;
+            sweep_dir = 1.0f;
         }
     }
 
     if (a_up && d_up) {
-        /* A上 D上:锁角度(锁住进入时的角度,由 gimbal 侧捕获当前角度) */
-        gimbal_cmd_send.mode         = YAW_ANGLE_LOCK;
-        gimbal_cmd_send.target_speed = 0.0f;
-    } else if (a_up) {
-        /* A上 D下:目标速度在 [YAW_SPEED_SWEEP_MIN, YAW_SPEED_SWEEP_MAX] 之间线性来回摆动 */
-        gimbal_cmd_send.mode = YAW_SPEED_CTRL;
-        sweep_speed += YAW_SPEED_SWEEP_RATE * sweep_dir * dt;
-        if (sweep_speed >= YAW_SPEED_SWEEP_MAX) { // 扫到上限就掉头
-            sweep_speed = YAW_SPEED_SWEEP_MAX;
-            sweep_dir   = -1.0f;
-        } else if (sweep_speed <= YAW_SPEED_SWEEP_MIN) { // 扫到下限就掉头
-            sweep_speed = YAW_SPEED_SWEEP_MIN;
-            sweep_dir   = 1.0f;
+        rc_dbg_yaw_gear = 3;
+        /* A上 D上:LD 决定正向加速度大小,不启用负方向。 */
+        gimbal_cmd_send.mode    = YAW_SPEED_CTRL;
+        gimbal_cmd_send.profile = GIMBAL_PROFILE_SWEEP;
+
+        float accel_mag = gimbal_sweep_accel_rad;
+        if (accel_mag < 0.0f)
+            accel_mag = 0.0f;
+
+        if (accel_mag > 0.0f) {
+            /* 正向三角波:0→+7→0→+7 rad/s,加速度大小由 LD 控制。 */
+            sweep_accel = sweep_dir * accel_mag * RAD_2_DEGREE;
+            sweep_speed += sweep_accel * dt;
+
+            if (sweep_dir > 0.0f && sweep_speed >= YAW_SPEED_SWEEP_MAX) {
+                sweep_speed = YAW_SPEED_SWEEP_MAX;
+                sweep_dir = -1.0f;
+            } else if (sweep_dir < 0.0f && sweep_speed <= 0.0f) {
+                sweep_speed = 0.0f;
+                sweep_dir = 1.0f;
+            }
+        } else {
+            /* LD=0:保持当前速度和当前半程方向。 */
+            sweep_accel = 0.0f;
         }
         gimbal_cmd_send.target_speed = sweep_speed;
+    } else if (a_up) {
+        rc_dbg_yaw_gear = 2;
+        /* A上 D下:云台卸电 */
+        gimbal_cmd_send.mode         = YAW_ZERO_FORCE;
+        gimbal_cmd_send.profile      = GIMBAL_PROFILE_CONSTANT;
+        gimbal_cmd_send.target_speed = 0.0f;
     } else {
-        /* A下 D上:按 yaw_mid_speed_ref 匀速旋转,右摇杆"拨一下"加减一个步长。
-         * 这里用"角度斜坡"而不是直接给速度环:目标角度按该角速度线性递增,
-         * gimbal 侧用 角度环(外)+速度环(内)+速度前馈 跟随 —— 这样低速摩擦小
-         * 也不会像"纯速度环+只有P"那样等幅震荡(不需要 D,不会有啸叫)。 */
-        gimbal_cmd_send.mode = YAW_ANGLE_RAMP;
-        float r1             = stick;
-        if (stick_armed) {
-            if (r1 > YAW_STICK_UP_TH) { // 往上拨一下:加速
-                yaw_mid_speed_ref += YAW_SPEED_STEP;
-                stick_armed = 0;
-            } else if (r1 < YAW_STICK_DOWN_TH) { // 往下拨一下:减速
-                yaw_mid_speed_ref -= YAW_SPEED_STEP;
-                stick_armed = 0;
-            }
-        } else if (r1 < YAW_STICK_MID_ZONE && r1 > -YAW_STICK_MID_ZONE) {
-            stick_armed = 1; // 摇杆回中,允许下一次加减
-        }
-        yaw_mid_speed_ref = float_constrain(yaw_mid_speed_ref, YAW_SPEED_MIN, YAW_SPEED_MAX); // 最大/最小限幅
-        gimbal_cmd_send.target_speed = yaw_mid_speed_ref;
+        rc_dbg_yaw_gear = 1;
+        /* A下 D上:LD 映射匀速目标 */
+        gimbal_cmd_send.mode    = YAW_SPEED_CTRL;
+        gimbal_cmd_send.profile = GIMBAL_PROFILE_CONSTANT;
+        gimbal_cmd_send.target_speed = gimbal_ld_target_speed;
     }
 
-    PubPushMessage(gimbal_cmd_pub, (void *)&gimbal_cmd_send);
+    PublishCommand();
 }

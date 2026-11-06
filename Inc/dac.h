@@ -35,13 +35,11 @@ extern "C" {
 extern DAC_HandleTypeDef hdac;
 
 /* USER CODE BEGIN Private defines */
-
 /* USER CODE END Private defines */
 
 void MX_DAC_Init(void);
 
 /* USER CODE BEGIN Prototypes */
-
 /* USER CODE END Prototypes */
 
 #ifdef __cplusplus

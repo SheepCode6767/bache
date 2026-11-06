@@ -22,6 +22,7 @@
 #include "stm32f4xx_it.h"
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
+#include "bsp_log.h" /* 故障现场要通过 RTT 打出来(LOGERROR),见 FaultCapture() */
 /* USER CODE END Includes */
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN TD */
@@ -40,6 +41,13 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN PV */
+
+/* ================= 故障现场记录(只在 HardFault_Handler 里写,用 Ozone 的 watch 读) ================= */
+volatile uint32_t hf_cfsr, hf_hfsr, hf_bfar, hf_mmfar;
+volatile uint32_t hf_pc, hf_lr, hf_psr, hf_r0, hf_r1, hf_r2, hf_r3;
+volatile uint32_t *hf_frame; /* 异常压栈的那个栈帧(见handler里的说明) */
+volatile uint8_t hf_stage;   /* 1=进了handler 2=已抄完 3=准备停住 */
+volatile uint32_t hf_exc_return; /* 进入异常时的 LR(EXC_RETURN),用来判断 MSP/PSP 和 FPU 栈帧 */
 
 /* USER CODE END PV */
 
@@ -104,64 +112,108 @@ void NMI_Handler(void)
 }
 
 /**
+  * @brief 把故障现场抄进 hf_* 变量(四个 fault handler 共用)。
+  *
+  * @param frame       异常压栈的栈帧,由下面的汇编入口在"刚进入异常"时取 MSP/PSP 得到
+  * @param exc_return  进入异常时的 LR(EXC_RETURN),bit2=1 表示原任务用 PSP
+  *
+  * @note 旧实现把 `tst lr,#4; mrseq ...` 放在这个普通 C 函数里。编译器执行到那里时
+  *       LR 已经是"从 FaultCapture 返回"的地址,不再是 EXC_RETURN;在中断里出错时
+  *       会抄错栈帧,严重时还会在 handler 里再次 fault。现在由下面四个 naked 入口
+  *       在进入异常的第一条指令处选栈,再把栈帧指针作为第一个参数传进来。
+  */
+static void FaultCapture(uint32_t *frame, uint32_t exc_return)
+    __attribute__((noreturn, noinline, used));
+
+static void FaultCapture(uint32_t *frame, uint32_t exc_return)
+{
+  hf_stage      = 1;
+  hf_frame      = frame;
+  hf_exc_return = exc_return;
+
+  hf_cfsr  = SCB->CFSR;
+  hf_hfsr  = SCB->HFSR;
+  hf_bfar  = SCB->BFAR;
+  hf_mmfar = SCB->MMFAR;
+  hf_stage = 2;
+  if (frame != 0) {
+    /* Cortex-M 的异常栈帧前 8 个字固定是 R0-R3,R12,LR,PC,xPSR。
+     * 是否带 FPU 扩展帧只影响 xPSR 后面的 S0-S15/FPSCR,不影响这 8 个。 */
+    hf_r0  = frame[0];
+    hf_r1  = frame[1];
+    hf_r2  = frame[2];
+    hf_r3  = frame[3];
+    hf_lr  = frame[5];
+    hf_pc  = frame[6];
+    hf_psr = frame[7];
+  }
+
+  /* 把现场直接打到 Ozone 的 Terminal(RTT)窗口里 —— 不用去 watch 里逐个看。
+   * 格式符只用 %X/%d,不碰 %f(见 bsp_log.h 的说明)。 */
+  LOGERROR("[fault] stage=%d EXC=%08X CFSR=%08X HFSR=%08X BFAR=%08X MMFAR=%08X IPSR=%03X PC=%08X LR=%08X R0=%08X R1=%08X R2=%08X R3=%08X",
+           (int)hf_stage, (unsigned)hf_exc_return,
+           (unsigned)hf_cfsr, (unsigned)hf_hfsr, (unsigned)hf_bfar, (unsigned)hf_mmfar,
+           (unsigned)(hf_psr & 0x1FFu), (unsigned)hf_pc, (unsigned)hf_lr,
+           (unsigned)hf_r0, (unsigned)hf_r1, (unsigned)hf_r2, (unsigned)hf_r3);
+  hf_stage = 3;
+  for (;;) {
+  }
+}
+
+/* 四个 fault 入口共用的第一段汇编:
+ *   r1 = EXC_RETURN(刚进异常时的 LR)
+ *   bit2=1 -> 原任务用 PSP,否则用 MSP
+ *   r0 = 异常压栈的栈帧指针,然后直接跳到 FaultCapture(r0,r1)
+ * 入口必须是 naked,否则编译器会在我们读 LR 之前插入 push。 */
+#define FAULT_ENTRY_ASM                 \
+  "mov r1, lr                       \n" \
+  "tst lr, #4                      \n" \
+  "ite eq                          \n" \
+  "mrseq r0, msp                   \n" \
+  "mrsne r0, psp                   \n" \
+  "b FaultCapture                  \n"
+
+/**
   * @brief This function handles Hard fault interrupt.
   */
-void HardFault_Handler(void)
+__attribute__((naked, noreturn)) void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
- __asm volatile("bx lr");
+  __asm volatile(FAULT_ENTRY_ASM);
   /* USER CODE END HardFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_HardFault_IRQn 0 */
-    __asm volatile("bx lr");
-    /* USER CODE END W1_HardFault_IRQn 0 */
-  }
 }
 
 /**
   * @brief This function handles Memory management fault.
   */
-void MemManage_Handler(void)
+__attribute__((naked, noreturn)) void MemManage_Handler(void)
 {
   /* USER CODE BEGIN MemoryManagement_IRQn 0 */
 
+  __asm volatile(FAULT_ENTRY_ASM);
   /* USER CODE END MemoryManagement_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_MemoryManagement_IRQn 0 */
-    /* USER CODE END W1_MemoryManagement_IRQn 0 */
-  }
 }
 
 /**
   * @brief This function handles Pre-fetch fault, memory access fault.
   */
-void BusFault_Handler(void)
+__attribute__((naked, noreturn)) void BusFault_Handler(void)
 {
   /* USER CODE BEGIN BusFault_IRQn 0 */
 
+  __asm volatile(FAULT_ENTRY_ASM);
   /* USER CODE END BusFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_BusFault_IRQn 0 */
-    /* USER CODE END W1_BusFault_IRQn 0 */
-  }
 }
 
 /**
   * @brief This function handles Undefined instruction or illegal state.
   */
-void UsageFault_Handler(void)
+__attribute__((naked, noreturn)) void UsageFault_Handler(void)
 {
   /* USER CODE BEGIN UsageFault_IRQn 0 */
 
+  __asm volatile(FAULT_ENTRY_ASM);
   /* USER CODE END UsageFault_IRQn 0 */
-  while (1)
-  {
-    /* USER CODE BEGIN W1_UsageFault_IRQn 0 */
-    /* USER CODE END W1_UsageFault_IRQn 0 */
-  }
 }
 
 /**
@@ -551,8 +603,22 @@ void OTG_FS_IRQHandler(void)
 {
   /* USER CODE BEGIN OTG_FS_IRQn 0 */
 
+  /* 本车不用 USB,所以这个中断**无条件**不该跑 USB 栈:
+   *   - 正常情况 main() 里已经把它的 NVIC 使能位清掉了,根本进不来;
+   *   - 但调试器的"内核复位"不会清 NVIC/外设,上一次会话(或旧固件)可能把这个使能位留下,
+   *     中断就会在上电最初、连 .bss 都还没清零的时候触发 —— 那时候判断句柄状态是不可靠的
+   *     (RAM 里可能是上一次运行留下的旧值)。而带着从未初始化的句柄去跑 HAL_PCD_IRQHandler,
+   *     会一路走到 USB_SetDevAddress(NULL,...) 之类的地方往 0x00000800(flash 别名区)写,
+   *     或者从野指针跳走(PC 变成 0xFFFFFFFE) —— 都是极难查的 HardFault。
+   * 所以这里**只做寄存器操作**(不依赖任何 RAM 内容),直接关掉并返回。
+   *
+   * 以后真要接上位机/USB CDC:先把 main() 里那三行禁用 USB 中断的代码去掉,
+   * 再把下面那行 HAL_PCD_IRQHandler() 的注释恢复即可。 */
+  HAL_NVIC_DisableIRQ(OTG_FS_IRQn);
+  HAL_NVIC_ClearPendingIRQ(OTG_FS_IRQn);
+  // HAL_PCD_IRQHandler(&hpcd_USB_OTG_FS);
+  return;
   /* USER CODE END OTG_FS_IRQn 0 */
-  HAL_PCD_IRQHandler(&hpcd_USB_OTG_FS);
   /* USER CODE BEGIN OTG_FS_IRQn 1 */
 
   /* USER CODE END OTG_FS_IRQn 1 */

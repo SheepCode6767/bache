@@ -68,7 +68,14 @@
 #define configTICK_RATE_HZ                       ((TickType_t)1000)
 #define configMAX_PRIORITIES                     ( 56 )
 #define configMINIMAL_STACK_SIZE                 ((uint16_t)128)
-#define configTOTAL_HEAP_SIZE                    ((size_t)20000)
+/* 任务栈溢出检查:2 = 任务切换时检查栈末尾的填充图案(建任务时填的0xA5),溢出就调用
+ * vApplicationStackOverflowHook()(在 freertos.c 里),把任务名记到 so_task_name 并停住。
+ * 之所以要打开:512 字节的任务栈在本工程里很容易溢出,而溢出会直接踩坏堆里相邻的内存
+ * (别的任务的栈/TCB),表现往往就是"在毫不相干的指令上莫名其妙 HardFault",极难定位。 */
+#define configCHECK_FOR_STACK_OVERFLOW           2
+/* 任务栈从原来的 512B 档位整体上调(尤其 Gimbal 要调 sinf/fmodf),这里同步留出余量。
+ * 当前 RAM 仍只用到约 86KB/128KB,不要为了省几 KB 再把任务栈压回去。 */
+#define configTOTAL_HEAP_SIZE                    ((size_t)32768)
 #define configMAX_TASK_NAME_LEN                  ( 32 )
 #define configUSE_TRACE_FACILITY                 1
 #define configUSE_16_BIT_TICKS                   0

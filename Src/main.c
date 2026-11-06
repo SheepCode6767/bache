@@ -101,6 +101,34 @@ int main(void)
    * 那段 100ms 忙等里, PWM 也会变成静止电平, 蜂鸣器不会持续发声。 */
   DBGMCU->APB1FZ |= DBGMCU_APB1_FZ_DBG_TIM4_STOP;
 
+  /* ================= 调试用:把"异步总线错误"变成"精确总线错误" =================
+   * 症状:报的是 HardFault,而 hf_cfsr 只有 bit10 IMPRECISERR —— 意思是"某条写指令写到了
+   *       不存在的地址",但错误要等写缓冲排空才报,于是报错 PC 会漂到后面几条指令上(甚至漂进
+   *       另一个函数),看不出凶手是谁。
+   * 办法:关掉写缓冲(SCB->ACTLR.DISDEFWBUF)。这样每条 store 都必须在总线上当场完成,
+   *       往坏地址写会**立刻**在该 store 指令上报错:hf_pc/hf_lr 直指凶手,hf_bfar 给出坏地址。
+   * 代价:写性能略降(168MHz 的小车可忽略)。查完问题可以把这一行删掉。 */
+  SCnSCB->ACTLR |= SCnSCB_ACTLR_DISDEFWBUF_Msk; /* 注:ACTLR 在 SCnSCB 里,不在 SCB 里 */
+
+  /* 默认 MemManage/BusFault/UsageFault 三个异常是**关着**的,任何故障都被升级成 HardFault,
+   * 于是看不到原始故障类型。单独打开它们之后,Ozone 会直接说是 BusFault 还是 UsageFault,
+   * 精确总线错误的 BFAR 也才是有效的。 */
+  SCB->SHCSR |= SCB_SHCSR_MEMFAULTENA_Msk | SCB_SHCSR_BUSFAULTENA_Msk | SCB_SHCSR_USGFAULTENA_Msk;
+
+  /* ================= 把不用到的 USB 中断彻底关掉 =================
+   * 本车不用 USB(MX_USB_DEVICE_Init() 在 freertos.c 里是注释掉的),但 OTG_FS 的中断使能位
+   * 可能**残留在 NVIC 里**:调试器的"复位"如果是内核复位(core reset),外设和 NVIC 都不会被清,
+   * 上一次跑过 USB 初始化代码的会话就会把这个使能位留下来。
+   * 结果:USB 中断被触发时,USB 栈其实从未初始化 —— hpcd_USB_OTG_FS 全 0,Instance=NULL,
+   * HAL_PCD_IRQHandler 拿着空句柄一路走下去,最后 USBD 的状态机去执行
+   * USB_SetDevAddress(NULL, addr) => str.w r3,[r0,#0x800] 往 0x00000800(flash 别名区)写。
+   * 这种写产生的是**异步**总线错误(CFSR 的 IMPRECISERR),报错 PC 会漂到后面几条指令、
+   * 甚至漂进别的函数里,所以看起来像"毫不相干的代码炸了",极难定位。
+   * 这里在开机最早的时候禁用并清掉它;USB 时钟本来也没使能,双保险。 */
+  HAL_NVIC_DisableIRQ(OTG_FS_IRQn);
+  HAL_NVIC_ClearPendingIRQ(OTG_FS_IRQn);
+  __HAL_RCC_USB_OTG_FS_CLK_DISABLE();
+
   /* USER CODE END 1 */
 
   /* MCU Configuration--------------------------------------------------------*/
